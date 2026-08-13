@@ -13,7 +13,8 @@ app.get("/", (req, res) => {
   res.json({
     status: "online",
     app: "Adaptra.AI",
-    version: "3.5"
+    version: "3.5",
+    imageGeneration: true
   });
 });
 
@@ -21,29 +22,35 @@ app.post("/generate", async (req, res) => {
   try {
     const { prompt } = req.body;
 
-    if (!prompt || !prompt.trim()) {
+    if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
       return res.status(400).json({
+        success: false,
         error: "Digite uma descrição para a imagem."
       });
     }
 
+    console.log("Gerando imagem:", prompt);
+
     const image = await hf.textToImage({
-      provider: "hf-inference",
+      provider: "auto",
       model: "black-forest-labs/FLUX.1-schnell",
       inputs: prompt.trim()
     });
 
     const buffer = Buffer.from(await image.arrayBuffer());
 
+    res.status(200);
     res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "no-store");
     res.send(buffer);
 
   } catch (error) {
-    console.error("Erro na geração:", error);
+    console.error("ERRO NA GERAÇÃO:", error);
 
     res.status(500).json({
+      success: false,
       error: "Não foi possível gerar a imagem.",
-      details: error.message
+      details: error.message || "Erro desconhecido"
     });
   }
 });
@@ -51,5 +58,5 @@ app.post("/generate", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Adaptra.AI funcionando na porta ${PORT}`);
+  console.log(`Adaptra.AI 3.5 online na porta ${PORT}`);
 });
