@@ -1,236 +1,385 @@
-import express from "express";
-import cors from "cors";
-import { InferenceClient } from "@huggingface/inference";
+const express = require("express");
+const cors = require("cors");
+const { InferenceClient } = require("@huggingface/inference");
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
 const HF_TOKEN = process.env.HF_TOKEN;
-const hf = HF_TOKEN ? new InferenceClient(HF_TOKEN) : null;
 
-const CHAT_MODELS = [
-  process.env.HF_CHAT_MODEL || "Qwen/Qwen3-32B",
-  "openai/gpt-oss-120b"
-];
+// ===============================
+// CONFIGURAÇÃO
+// ===============================
 
-const IMAGE_MODELS = [
-  process.env.HF_IMAGE_MODEL || "black-forest-labs/FLUX.1-schnell",
-  "black-forest-labs/FLUX.1-dev"
-];
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
 
-const SYSTEM_PROMPT = `Você é a Adaptra.AI, uma assistente brasileira criada por Jheymison.
-Seja amigável, natural, inteligente e objetiva.
-Entenda o contexto das mensagens anteriores e não repita perguntas já respondidas.
-Se houver contexto suficiente, responda diretamente em vez de pedir mais explicações.
-Faça perguntas apenas quando realmente faltar uma informação importante.
-Perguntas simples devem receber respostas curtas; pedidos de detalhes podem receber respostas completas.
-Nunca invente fatos. Se não souber, diga que não sabe.
-Responda em português do Brasil, salvo pedido contrário.
-Se perguntarem quem é seu criador, responda exatamente: "Meu criador é Jheymison."
-Use o histórico da conversa enviado pelo aplicativo.`;
+app.use(express.json({ limit: "2mb" }));
 
-function cleanText(v) {
-  return String(v ?? "")
+const hf = HF_TOKEN
+  ? new InferenceClient(HF_TOKEN)
+  : null;
+
+// Modelo de conversa.
+// O Hugging Face escolhe automaticamente um provider compatível
+// quando provider: "auto" é utilizado.
+const CHAT_MODEL = "Qwen/Qwen3-4B-Instruct-2507";
+
+const IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell";
+
+// Memória temporária do servidor.
+// Importante: reiniciar o Render apaga esta memória.
+const conversations = new Map();
+
+// ===============================
+// PERSONALIDADE DA ADAPTRA
+// ===============================
+
+const SYSTEM_PROMPT = `
+Você é a Adaptra.AI, uma assistente virtual brasileira.
+
+Sua personalidade:
+- amigável
+- inteligente
+- natural
+- paciente
+- objetiva
+- curiosa
+- prestativa
+- conversa como uma pessoa, sem parecer robótica
+
+Idioma:
+- responda sempre em português do Brasil, salvo se o usuário pedir outro idioma.
+
+Estilo:
+- não repita a mesma resposta sem motivo
+- não peça para o usuário explicar novamente algo que já foi explicado
+- use o contexto anterior da conversa
+- responda diretamente primeiro
+- faça perguntas apenas quando realmente forem necessárias
+- não invente informações
+- se não souber algo, diga claramente que não sabe
+- use emojis com moderação
+- não transforme toda resposta em uma lista
+- mantenha respostas simples quando a pergunta for simples
+- seja mais detalhada quando o usuário pedir detalhes
+
+Contexto do projeto:
+A Adaptra.AI está sendo desenvolvida por Jheymison.
+
+Quando perguntarem:
+"quem é seu criador?"
+"quem desenvolveu você?"
+"quem é seu desenvolvedor?"
+responda:
+"Meu criador é Jheymison. 🤖"
+
+Não diga que foi criada pela OpenAI.
+Não invente outro criador.
+
+Se o usuário estiver desenvolvendo um projeto, ajude passo a passo.
+Se ele disser algo como "quero criar um jogo", continue o assunto usando o contexto da conversa.
+
+Você não deve responder apenas:
+"Pode me explicar melhor?"
+quando já houver informação suficiente.
+
+Exemplo:
+Usuário: "Quero criar um jogo."
+Resposta adequada:
+"Claro! 🎮 Podemos criar. Você quer fazer um jogo 2D, 3D, para celular ou navegador?"
+
+Usuário: "Um RPG 2D."
+Resposta adequada:
+"Sim! Podemos montar um RPG 2D. Podemos começar pelo personagem, mapa, combate, monstros, itens e sistema de níveis."
+
+Usuário: "Consegue fazer?"
+Resposta adequada:
+"Consigo te ajudar a construir. Podemos começar pela estrutura do jogo e depois adicionar cada sistema."
+
+Nunca repita uma pergunta de esclarecimento se o usuário já respondeu.
+`;
+
+// ===============================
+// FUNÇÕES AUXILIARES
+// ===============================
+
+function cleanText(text) {
+  if (!text) return "";
+
+  return String(text)
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<\|im_end\|>/g, "")
-    .replace(/<\|endoftext\|>/g, "")
+    .replace(/<\|im_end\|>/gi, "")
+    .replace(/<\|endoftext\|>/gi, "")
     .trim();
 }
 
-function msgError(e) {
-  return e?.message || e?.response?.statusText || "Erro desconhecido.";
-}
+function getConversation(id) {
+  const key = String(id || "default");
 
-function timeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} demorou demais para responder.`)), ms)
-    )
-  ]);
-}
-
-function normalizeMessages(list) {
-  if (!Array.isArray(list)) return [];
-  return list
-    .filter(x => x && typeof x.content === "string")
-    .slice(-12)
-    .map(x => ({
-      role: ["user", "assistant"].includes(x.role) ? x.role : "user",
-      content: x.content.slice(0, 12000)
-    }));
-}
-
-async function chat(prompt, history) {
-  if (!hf) throw new Error("HF_TOKEN não está configurado no Render.");
-
-  let lastError;
-  for (const model of [...new Set(CHAT_MODELS)]) {
-    try {
-      const r = await timeout(
-        hf.chatCompletion({
-          provider: "auto",
-          model,
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            ...history,
-            { role: "user", content: prompt }
-          ],
-          max_tokens: 500,
-          temperature: 0.65,
-          top_p: 0.9
-        }),
-        90000,
-        "A resposta"
-      );
-
-      const text = cleanText(r?.choices?.[0]?.message?.content);
-      if (text) return { text, model };
-      lastError = new Error(`O modelo ${model} não retornou texto.`);
-    } catch (e) {
-      console.error(`Falha no chat (${model}):`, msgError(e));
-      lastError = e;
-    }
+  if (!conversations.has(key)) {
+    conversations.set(key, []);
   }
-  throw lastError || new Error("Nenhum modelo de conversa respondeu.");
+
+  return conversations.get(key);
 }
 
-async function generateImage(prompt) {
-  if (!hf) throw new Error("HF_TOKEN não está configurado no Render.");
-
-  let lastError;
-  for (const model of [...new Set(IMAGE_MODELS)]) {
-    try {
-      const image = await timeout(
-        hf.textToImage({
-          provider: "auto",
-          model,
-          inputs: prompt
-        }),
-        150000,
-        "A geração da imagem"
-      );
-
-      if (!image || typeof image.arrayBuffer !== "function") {
-        throw new Error(`O modelo ${model} não retornou uma imagem válida.`);
-      }
-
-      const buffer = Buffer.from(await image.arrayBuffer());
-      if (!buffer.length) throw new Error("A imagem retornada está vazia.");
-
-      return { buffer, model };
-    } catch (e) {
-      console.error(`Falha na imagem (${model}):`, msgError(e));
-      lastError = e;
-    }
-  }
-  throw lastError || new Error("Nenhum modelo de imagem respondeu.");
+function limitHistory(messages) {
+  return messages.slice(-20);
 }
+
+// ===============================
+// ROTA PRINCIPAL
+// ===============================
 
 app.get("/", (req, res) => {
   res.json({
-    status: "online",
+    online: true,
     app: "Adaptra.AI",
     version: "3.5",
     creator: "Jheymison",
     chat: true,
-    imageGeneration: true
+    imageGeneration: true,
+    status: HF_TOKEN ? "ready" : "missing_HF_TOKEN"
   });
 });
+
+// ===============================
+// STATUS
+// ===============================
 
 app.get("/health", (req, res) => {
   res.json({
-    ok: true,
-    configured: Boolean(HF_TOKEN),
-    chat: Boolean(hf),
-    imageGeneration: Boolean(hf),
-    version: "3.5"
+    status: "ok",
+    adaptra: "online",
+    version: "3.5",
+    huggingface: Boolean(HF_TOKEN)
   });
 });
 
+// ===============================
+// CHAT
+// ===============================
+
 app.post("/chat", async (req, res) => {
   try {
-    const message = typeof req.body?.message === "string"
-      ? req.body.message.trim()
-      : "";
+    if (!HF_TOKEN || !hf) {
+      return res.status(500).json({
+        success: false,
+        error: "HF_TOKEN não configurado no Render."
+      });
+    }
 
-    if (!message) {
+    const {
+      message,
+      conversationId = "default",
+      history = []
+    } = req.body || {};
+
+    if (
+      typeof message !== "string" ||
+      !message.trim()
+    ) {
       return res.status(400).json({
         success: false,
-        error: "Envie uma mensagem em 'message'."
+        error: "Envie uma mensagem válida."
       });
     }
 
-    if (message.length > 12000) {
-      return res.status(413).json({
-        success: false,
-        error: "A mensagem é muito grande."
-      });
+    const userMessage = message.trim();
+
+    // Recupera a conversa do servidor.
+    const serverHistory = getConversation(conversationId);
+
+    // Se o frontend enviou histórico, usamos ele.
+    // Caso contrário, usamos o histórico temporário do servidor.
+    let previousMessages =
+      Array.isArray(history) && history.length
+        ? history
+        : serverHistory;
+
+    previousMessages = previousMessages
+      .filter(m =>
+        m &&
+        (m.role === "user" || m.role === "assistant") &&
+        typeof m.content === "string"
+      )
+      .slice(-16);
+
+    const messages = [
+      {
+        role: "system",
+        content: SYSTEM_PROMPT
+      },
+      ...previousMessages,
+      {
+        role: "user",
+        content: userMessage
+      }
+    ];
+
+    const result = await hf.chatCompletion({
+      model: CHAT_MODEL,
+      provider: "auto",
+      messages,
+      max_tokens: 500,
+      temperature: 0.7,
+      top_p: 0.9
+    });
+
+    let answer =
+      result?.choices?.[0]?.message?.content || "";
+
+    answer = cleanText(answer);
+
+    if (!answer) {
+      throw new Error("A IA não retornou texto.");
     }
 
-    const history = normalizeMessages(req.body?.messages);
-    const result = await chat(message, history);
+    // Salva somente a conversa recente.
+    serverHistory.push(
+      {
+        role: "user",
+        content: userMessage
+      },
+      {
+        role: "assistant",
+        content: answer
+      }
+    );
+
+    conversations.set(
+      String(conversationId),
+      limitHistory(serverHistory)
+    );
 
     res.json({
       success: true,
-      reply: result.text,
-      model: result.model
+      answer,
+      conversationId,
+      model: CHAT_MODEL
     });
-  } catch (e) {
-    console.error("ERRO NO CHAT:", e);
-    res.status(502).json({
+
+  } catch (error) {
+    console.error("ERRO NO CHAT:", error);
+
+    res.status(500).json({
       success: false,
-      error: "A Adaptra não conseguiu gerar uma resposta agora.",
-      details: msgError(e)
+      error: "Não consegui responder agora.",
+      details:
+        process.env.NODE_ENV === "development"
+          ? error.message
+          : undefined
     });
   }
 });
 
+// ===============================
+// GERADOR DE IMAGENS
+// ===============================
+
 app.post("/generate", async (req, res) => {
   try {
-    const prompt = typeof req.body?.prompt === "string"
-      ? req.body.prompt.trim()
-      : "";
-
-    if (!prompt) {
-      return res.status(400).json({
+    if (!HF_TOKEN || !hf) {
+      return res.status(500).json({
         success: false,
-        error: "Envie uma descrição em 'prompt'."
+        error: "HF_TOKEN não configurado no Render."
       });
     }
 
-    if (prompt.length > 4000) {
-      return res.status(413).json({
+    const { prompt } = req.body || {};
+
+    if (
+      typeof prompt !== "string" ||
+      !prompt.trim()
+    ) {
+      return res.status(400).json({
         success: false,
-        error: "A descrição da imagem é muito grande."
+        error: "Digite uma descrição para a imagem."
       });
     }
 
     console.log("Gerando imagem:", prompt);
-    const result = await generateImage(prompt);
+
+    const image = await hf.textToImage({
+      model: IMAGE_MODEL,
+      provider: "auto",
+      inputs: prompt.trim()
+    });
+
+    const buffer = Buffer.from(
+      await image.arrayBuffer()
+    );
 
     res.status(200);
     res.set("Content-Type", "image/png");
     res.set("Cache-Control", "no-store");
-    res.set("X-Adaptra-Model", result.model);
-    res.send(result.buffer);
-  } catch (e) {
-    console.error("ERRO NA GERAÇÃO DE IMAGEM:", e);
-    res.status(502).json({
+    res.send(buffer);
+
+  } catch (error) {
+    console.error("ERRO NA GERAÇÃO:", error);
+
+    res.status(500).json({
       success: false,
-      error: "Não foi possível gerar a imagem agora.",
-      details: msgError(e)
+      error: "Não foi possível gerar a imagem.",
+      details: error.message || "Erro desconhecido"
     });
   }
 });
 
-app.use((req, res) => {
-  res.status(404).json({ success: false, error: "Rota não encontrada." });
+// ===============================
+// LIMPAR CONVERSA
+// ===============================
+
+app.post("/clear", (req, res) => {
+  const { conversationId = "default" } = req.body || {};
+
+  conversations.delete(String(conversationId));
+
+  res.json({
+    success: true,
+    message: "Conversa limpa."
+  });
 });
 
+// ===============================
+// 404
+// ===============================
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: "Rota não encontrada."
+  });
+});
+
+// ===============================
+// ERROS DO EXPRESS
+// ===============================
+
+app.use((error, req, res, next) => {
+  console.error("ERRO:", error);
+
+  res.status(500).json({
+    success: false,
+    error: "Erro interno do servidor."
+  });
+});
+
+// ===============================
+// INICIAR SERVIDOR
+// ===============================
+
 app.listen(PORT, () => {
-  console.log(`Adaptra.AI 3.5 online na porta ${PORT}`);
-  console.log(`HF_TOKEN configurado: ${Boolean(HF_TOKEN)}`);
+  console.log("=================================");
+  console.log("🤖 Adaptra.AI 3.5");
+  console.log("👤 Criador: Jheymison");
+  console.log(`🌐 Porta: ${PORT}`);
+  console.log(`🔐 HF_TOKEN: ${HF_TOKEN ? "OK" : "AUSENTE"}`);
+  console.log("💬 Chat: /chat");
+  console.log("🖼️ Imagens: /generate");
+  console.log("=================================");
 });
