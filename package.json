@@ -1,6 +1,7 @@
-name": "adaptra-backend",
-  "version": "3.6.0",
-  "description": "Backend da Adaptra.AI",
+{
+  "name": "adaptra-backend",
+  "version": "4.3.0",
+  "description": "Backend da Adaptra.AI sem sistema de login",
   "main": "Server.js",
   "scripts": {
     "start": "node Server.js"
@@ -9,7 +10,6 @@ name": "adaptra-backend",
     "node": ">=18"
   },
   "dependencies": {
-    "@huggingface/inference": "^4.13.23",
     "cors": "^2.8.5",
     "express": "^4.21.2"
   }
