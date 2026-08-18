@@ -1,0 +1,18 @@
+{
+  "name": "adaptra-backend",
+  "version": "3.6.0",
+  "description": "Backend da Adaptra.AI",
+  "main": "Server.js",
+  "scripts": {
+    "start": "node Server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@huggingface/inference": "^4.13.23",
+    "@supabase/supabase-js": "^2.57.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  }
+  }
